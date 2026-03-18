@@ -1,0 +1,203 @@
+# yaml-language-server: $schema=http://team.cmdbuild.org/resources/cmdbuild/etl/waterway/config/v1/schema.json
+
+descriptor: OneShot
+description: Jira body-description update for all MAINT issues
+password: $password
+username: $username
+baseUrl: $baseUrl
+jiraProject: $jiraProject
+batchSize: $batchSize
+documentLink: $documentLink
+
+items:
+  - gate: DescriptionChange
+    access: private
+    processing: realtime
+
+    handlers:
+      - type: script
+        script: |
+          import groovy.json.JsonSlurper
+          import groovy.json.JsonOutput
+
+          def slurper = new JsonSlurper()
+
+          // ---------------------------------
+          // Load and validate parameters
+          // ---------------------------------
+          def baseUrl = "${baseUrl}"?.trim()
+          def username = "${username}"?.trim()
+          def password = "${password}"?.trim()
+          def jiraProject = "${jiraProject}"?.trim() ?: "DEVMAINT"
+          def batchSize = "${batchSize}"?.toInteger() ?: 100
+
+          if (!baseUrl || !username || !password) {
+            logger.error("[DescriptionChange] Parameters baseUrl, username or password missing")
+            return false
+          }
+
+          def authBase64 = "${username}:${password}".bytes.encodeBase64().toString()
+
+          // ---------------------------------
+          // Load the email template
+          // ---------------------------------
+          def tpl = cmdb.queryClass("_EmailTemplate")
+              .with("Code", "Jira-Description")
+              .fetch()
+              .find()
+
+          if (!tpl) {
+            logger.error("[DescriptionChange] Template 'Jira-Description' not found")
+            return false
+          }
+
+          def newDescription = tpl.Body?.trim()
+          if (!newDescription) {
+            logger.warn("[DescriptionChange] Template body is empty")
+            return true
+          }
+          newDescription = newDescription.replace('${documentLink}', documentLink);
+          
+          // ---------------------------------
+          // JQL Search for MAINT issues (POST Method)
+          // ---------------------------------
+
+          // CRITICAL: The JQL query must be bounded. Added a time filter.
+          def jql = "project = ${jiraProject} AND status IN (\"Open\", \"In Progress\")"
+          def allIssues = []
+          def nextPageToken = null
+          // Request only the 'key' field to maximize results per call
+          def requestedFields = ["key", "summary"]
+
+          try {
+              do {
+                  def searchUrl = "${baseUrl}search/jql"
+
+                  // Build JSON payload for POST request
+                  def payloadMap = [
+                      jql: jql,
+                      maxResults: batchSize,
+                      fields: requestedFields
+                  ]
+                  if (nextPageToken) {
+                      payloadMap["nextPageToken"] = nextPageToken
+                  }
+
+                  def payload = JsonOutput.toJson(payloadMap)
+
+                  // Execute POST request
+                  def searchResponse = cmdb.rest()
+                      .headers([
+                          "Authorization": "Basic ${authBase64}",
+                          "Accept": "application/json",
+                          "Content-Type": "application/json"
+                      ])
+                      .body(payload)
+                      .post(searchUrl)
+                      .then()
+                      .extract()
+                      .body()
+                      .asString()
+
+                  if (!searchResponse) {
+                      logger.error("[DescriptionChange] No response from JQL API")
+                      return false
+                  }
+                  def jqlResult = slurper.parseText(searchResponse)
+
+                  if (jqlResult.errorMessages) {
+                      logger.error("[DescriptionChange] JQL error: ${jqlResult.errorMessages}")
+                      return false
+                  }
+
+                  def issues = jqlResult.issues ?: []
+                  nextPageToken = jqlResult.nextPageToken
+
+                  issues.each { issue ->
+                      if (issue.key) {
+                          allIssues << [
+                            key: issue.key,
+                            summary: issue.fields?.summary
+                          ]
+                      }
+                  }
+
+                  logger.info("[DescriptionChange] Retrieved ${issues.size()} issues. Total: ${allIssues.size()}")
+
+              } while (nextPageToken)
+
+          } catch (Exception e) {
+              logger.error("[DescriptionChange] Error during JQL search: ${e.message}")
+              return false
+          }
+
+          if (allIssues.isEmpty()) {
+              logger.info("[DescriptionChange] No issues found for project ${jiraProject}")
+              return true
+          }
+
+          logger.info("[DescriptionChange] Found ${allIssues.size()} issues in ${jiraProject} to update")
+
+          // ---------------------------------
+          // JSON Payload for update
+          // ---------------------------------
+          def updatePayload(newDescription, ticketNumber){
+            def ticketDescr = newDescription.replace('${jiraDescription}', ticketNumber)
+            return """{
+              "fields": {
+                "description": {
+                  "version": 1,
+                  "type": "doc",
+                  "content": [
+                    ${ticketDescr}
+                  ]
+                }
+              }
+            }"""
+          }
+
+          // ---------------------------------
+          // Batch update of issues
+          // ---------------------------------
+          def successCount = 0
+          def errorCount = 0
+
+          allIssues.eachWithIndex { issue, index ->
+            try {
+              def key = issue.get("key");
+              def summary = issue.get("summary");
+              def updateUrl = "${baseUrl}issue/${key}"
+              def newBody = updatePayload(newDescription, summary);
+
+              def response = cmdb.rest()
+                  .headers([
+                    "Authorization": "Basic ${authBase64}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                  ])
+                  .body(newBody)
+                  .put(updateUrl)
+                  .then()
+                  .extract()
+
+              def statusCode = response.statusCode()
+              if (statusCode >= 200 && statusCode < 300) {
+                successCount++
+                if ((index + 1) % 50 == 0) {
+                  logger.info("[DescriptionChange] Progress: ${index + 1}/${allIssues.size()} issues updated")
+                }
+              } else {
+                errorCount++
+                def errorBody = response.body()?.asString()
+                logger.warn("[DescriptionChange] Error updating issue ${key}: HTTP ${statusCode} - ${errorBody}")
+              }
+
+            } catch (Exception e) {
+              errorCount++
+              logger.error("[DescriptionChange] Exception updating issue ${key}: ${e.message}")
+            }
+          }
+
+          logger.info("[DescriptionChange] Summary: ${successCount} issues updated successfully, ${errorCount} errors")
+
+          return true

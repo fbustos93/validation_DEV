@@ -1,0 +1,56 @@
+descriptor: PrevMaintNotify
+description: Preventive maintenance notification
+items:
+  - gate: PrevMaintNotifyDaily
+    access: private
+    processing: realtime
+    handlers:
+      - type: script
+        script: |
+            // Execute SQL query to generate PrevMaintList report for NextDay
+            def periodo = cmdb.selectLookupByCode("REP-PrevMaintList - Interval","NextDay");
+            // Logic to send email with PrevMaintList report
+            def reportFileName = cmdb.createReport("PrevMaintList", "PDF")
+              .with("periodo", periodo)
+              .download()
+              .getUrl();
+            cmdb.newMail()
+              .withAttachment(reportFileName)
+              .fromTemplate("PMN-NextDay")
+              .send();
+
+  - gate: PrevMaintNotifyWeekly
+    access: private
+    processing: realtime
+    handlers:
+      - type: script
+        script: |
+            // Execute SQL query to generate PrevMaintList report for NextWeek
+            def periodo = cmdb.selectLookupByCode("REP-PrevMaintList - Interval","NextWeek");
+            // Logic to send email with PrevMaintList report
+            def reportFileName = cmdb.createReport("PrevMaintList", "PDF")
+              .with("periodo", periodo)
+              .download()
+              .getUrl();
+            cmdb.newMail()
+              .withAttachment(reportFileName)
+              .fromTemplate("PMN-NextWeek")
+              .send();
+
+  - gate: PrevMaintNotifyMonthly
+    access: private
+    processing: realtime
+    handlers:
+      - type: script
+        script: |
+            // Execute SQL query to generate PrevMaintList report for NextMonth
+            def periodo = cmdb.selectLookupByCode("REP-PrevMaintList - Interval","NextMonth");
+            // Logic to send email with PrevMaintList report
+            def reportFileName = cmdb.createReport("PrevMaintList", "PDF")
+              .with("periodo", periodo)
+              .download()
+              .getUrl();
+            cmdb.newMail()
+              .withAttachment(reportFileName)
+              .fromTemplate("PMN-NextMonth")
+              .send();

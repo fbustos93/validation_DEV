@@ -1,0 +1,74 @@
+# yaml-language-server: $schema=http://team.cmdbuild.org/resources/cmdbuild/etl/waterway/config/v1/schema.json
+descriptor: PreventiveMaintMgmt
+description: Preventive management
+items:
+
+- gate: PrevMaintAdvance
+  access: private
+  processing: realtime
+  handlers:
+  - type: script
+    script: |
+      import org.json.JSONObject;
+
+      def ids = cmdb.callFunction("jb_prevmaint_advance_ids").execute().get("ids").tokenize("|");
+      for(id in ids){
+        logger.info("[PrevMaintAdvance] advancing PM process with id = {}", id);
+        cmdb.existingProcessInstance("PreventiveMaint", Long.valueOf(id)).advance();
+      }
+
+- gate: PrevMaintGenerator
+  access: private
+  processing: realtime
+  handlers:
+  - type: script
+    script: |
+      import java.text.SimpleDateFormat;
+      import org.json.JSONObject;
+      import org.json.JSONArray;
+
+      def configs=cmdb.queryClass("PrevMaintConfig").with("Active", "true").with("Status", "A").fetch();
+      def openingRole = cmdb.queryClass("Parameter").with("Code", "PM-Opening-AutomaticPerformer").fetch()?[0].get("Value") ?: "MaintOffice";
+      def length = configs.size();
+      int i = 0;
+      if (configs.size() < 1) {
+        cmdb.callFunction("jb_prevmaint_bound_date_default_set").execute();
+      }
+      for(config in configs){
+        def last_el = (++i == length)
+        def sequence = cmdb.callFunction("jb_prevmaint_date_sequence").with("config_id", config.getId()).with("last_config", Boolean.toString(last_el)).execute();
+        def definition = cmdb.existingCard("PrevMaintDef", config.get("PrevMaintDef").getId()).fetch();
+        def timestamps = new JSONArray(sequence.get("timestamps"));
+
+        for (int j = 0; j < timestamps.length(); j++) {
+          def timestamp = timestamps.getJSONObject(j);
+          cmdb.impersonate().group(openingRole).run({->
+            cmdb.newProcessInstance("PreventiveMaint")
+              .with("PrevMaintConfig",config.getId())
+              .with("ProcessStatus",cmdb.selectLookupByCode("Process - ProcessStatus", "PM-Opening"))
+              .with("Site", config.get("Site"))
+              .with("ShortDescr", config.get("Name").take(199))
+              .with("CISubset", config.get("CISubset"))
+              .with("Team", config.get("Team"))
+              .with("AutomaticConfig", true)
+              .with("Company", config.get("Company"))
+              .with("DueExecEndDate", timestamp.get("due_exec_end_date"))
+              .with("OpeningDate", timestamp.get("opening_date"))
+              .with("ExpExecStartDate", timestamp.get("exp_exec_start_date"))
+              .start();
+          });
+        }
+      }
+
+- gate: PrevMaintPlannerWs
+  access: private
+  processing: realtime
+  cm_job_useCurrentSession: true
+  handlers:
+  - type: script
+    script: |
+      def start = gate.getParam("start");
+      def end = gate.getParam("end");
+      def groups = gate.getParam("groups") ? gate.getParam("groups") : "";
+
+      output = cmdb.system().sql().query("""SELECT _data as instances FROM cp_opm_prevmaintplanner_data_get('${start}'::timestamptz, '${end}'::timestamptz, '${groups}')""");

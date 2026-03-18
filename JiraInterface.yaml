@@ -1,0 +1,1159 @@
+# yaml-language-server: $schema=http://team.cmdbuild.org/resources/cmdbuild/etl/waterway/config/v1/schema.json
+
+descriptor: JiraInterface
+description: Jira interface
+baseUrl: $baseUrl
+issuePrefix: $issuePrefix
+issueFieldFilter: $issueFieldFilter
+documentLink: $documentLink
+debug: $debug
+projectKey: $projectKey
+issueTypeName: $issueTypeName
+priorityName: $priorityName
+componentName: $componentName
+plannedLabel: $plannedLabel
+unplannedLabel: $unplannedLabel
+toEmplstoEmplsTeamCode: $toEmplstoEmplsTeamCode
+
+items:
+  ## init gate
+  - gate: Jira-CorrectiveMaint
+    description: Jira - Corrective maintenance
+    access: private
+    processing: realtime
+
+    handlers:
+      - type: script
+        script: |
+            import java.text.SimpleDateFormat;
+            import groovy.json.JsonSlurper;
+            import groovy.transform.Field;
+
+            // =========================
+            // Create Base64 authentication from username and password
+            @Field def authBase64 = "${username}:${password}".bytes.encodeBase64().toString();
+
+            // =========================...
+            // HELPER FUNCTIONS
+            // =========================
+
+            /**
+             * Determines the Jira assignee ID to use for the ticket.
+             * @param assigneeId    The existing assignee ID (if any)
+             * @param teamId        The team ID to find a supervisor for
+             * @param defAssignee   Default assignee to use if no valid assignee is found
+             * @return              The Jira assignee ID to use
+             */
+            def getAssigneeJiraId(assigneeId, teamId, defAssignee) {
+                if (assigneeId && assigneeId != -1) {
+                    return assigneeId
+                }
+
+                def supervisor = findTeamSupervisor(teamId)
+                if (!supervisor) {
+                    logger.info("No supervisor found for team: ${teamId}. Using default assignee.")
+                    return defAssignee
+                }
+
+                if (supervisor.JiraAssigneeId) {
+                    return supervisor.JiraAssigneeId
+                }
+
+                try {
+                    return getAndStoreJiraAssigneeId(supervisor.Email, supervisor.Id, defAssignee)
+                } catch (Exception e) {
+                    logger.error("Error JIRA fetching for ${supervisor.Email}: ${e.message}", e)
+                    return defAssignee
+                }
+            }
+
+            /**
+             * Finds the supervisor for a given team.
+             * @param teamId    The team ID to find the supervisor for
+             * @return          The supervisor record or null if not found
+             */
+            def findTeamSupervisor(teamId) {
+                def rows = cmdb.system().sql().query("""
+                    SELECT u."Id", u."JiraAssigneeId", u."Email"
+                    FROM "Employee" u
+                    JOIN "Team" t ON u."Id" = t."Supervisor" AND t."Status" = 'A'
+                    WHERE u."Status" = 'A' AND t."Id" = ${teamId}
+                """)
+
+                return rows ? rows[0] : null
+            }
+
+            /**
+             * Retrieves the Jira assignee ID for a given supervisor and updates the Employee record.
+             * @param supervisor   The supervisor record
+             * @param defAssignee  Default assignee ID
+             * @return             The Jira assignee ID
+             */
+            def getAndStoreJiraAssigneeId(email, employeeId, defAssignee) {
+                def response = cmdb.rest()
+                    .headers("Content-Type", "application/json")
+                    .headers("Authorization", "Basic ${authBase64}")
+                    .get("https://rubinobs.atlassian.net/rest/api/3/user/search?query=${email}")
+                    .then().extract().response()
+
+                def jsonResponse = new JsonSlurper().parseText(response.body().asString())
+                def jiraAssigneeId = (jsonResponse instanceof List && jsonResponse.size() > 0)
+                                    ? jsonResponse[0].accountId
+                                    : jsonResponse.accountId
+
+                if (response.getStatusCode() == 200 && jiraAssigneeId) {
+                    return jiraAssigneeId
+                } else {
+                    logger.info("Failed to retrieve assignee ID from Jira for employee: ${employeeId}\nAssigning default assignee. Response: ${jsonResponse}")
+                    return defAssignee
+                }
+            }
+
+            // Fetch the Preventive Maintenance process card using the provided proc_id
+            def maintProc = cmdb.existingCard("CorrectiveMaint", Long.valueOf(gate.getParam("proc_id"))).fetch();
+            def assigneeId = maintProc?.Assignee?.getId()
+            def teamId = maintProc?.Team?.getId()
+            def teamName = cmdb.queryClass("Team").with("Id", teamId)?.fetch()?.find()?.get("Name")?.trim()?.replaceAll("\\s+", "-")
+            def assigneeJira = debug ? defAssignee : getAssigneeJiraId(assigneeId, teamId, defAssignee)
+            def parameter = cmdb.queryClass("Parameter").with("Code", "Server-URL").fetch().find().get("Value");
+            def cmdbLink = "${parameter}/ui/#custompages/correctivemaint/processes/CorrectiveMaint/instances/${gate.getParam("proc_id")}";
+            def jiraDescription = maintProc?.Description ?: "";
+            def summary = jiraDescription;
+            def procId = maintProc?.Id
+            def notes = maintProc?.ProcessNotes ?: ""
+            def jiraDueDate = maintProc?.DueExecEndDate ? new SimpleDateFormat("yyyy-MM-dd").format(maintProc.DueExecEndDate) : "";
+
+            // Construct the JSON body to create a new Jira issue
+            def bodyRaw = """{
+                "fields": {
+                    "project": {
+                        "key": "${projectKey}"
+                    },
+                    "issuetype": {
+                        "name": "${issueTypeName}"
+                    },
+                    "assignee": {
+                        "id": "${debug ? defAssignee : (assigneeJira ?: defAssignee)}"
+                    },
+                    "summary": "${summary}",
+                    "priority": {
+                        "name": "${priorityName}"
+                    },
+                    "labels": [
+                        "${teamName}",
+                        "Summit", 
+                        "${unplannedLabel}"
+                    ],
+                    "description": {
+                    "version": 1,
+                    "type": "doc",
+                    "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "This is a maintenance activity from openMAINT: ${jiraDescription}\\n\\nThe group lead should confirm their group will be doing this work, then assign an appropriate technician/point-of-contact in Jira, and get the activity in the work schedule. The technician/point-of-contact will START PROGRESS on the Jira ticket, and then move to openMAINT to perform the work. Within openMAINT, the technician/point-of-contact will execute the maintenance activity, follow activity instructions provided, record progress, and send the maintenance activity for review. They do not need to return to Jira, all updates will be automatic.\\n\\nSee "
+                            },
+                            {
+                                "type": "text",
+                                "text": "here",
+                                "marks": [
+                                    {
+                                        "type": "link",
+                                        "attrs": {
+                                            "href": "${documentLink}"
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                            "type": "text",
+                            "text": " for reminders on how to execute the workflow in openMAINT."
+                            }
+                        ]
+                    }"""
+
+            // Add a orrizontal line + notes if is not empty
+            if (notes) {
+                bodyRaw += """,
+                    {
+                    "type": "rule"
+                    },
+                    {
+                    "type": "paragraph",
+                    "content": [
+                        {
+                        "type": "text",
+                        "text": "${notes}"
+                        }
+                    ]
+                    }
+                ]
+                }"""
+            } else {
+                bodyRaw += "]}"
+            }
+
+            // Add duedate if not empty
+            if (jiraDueDate){
+                bodyRaw += """, "duedate": "${jiraDueDate}"}}}""";
+            } else {
+                bodyRaw += "}}}"
+            }
+
+            // Send a POST request to Jira to create the issue
+            def response = cmdb.rest()
+                .headers("Content-Type", "application/json")
+                .headers("Authorization", "Basic ${authBase64}")
+                .body(bodyRaw)
+                .post("https://rubinobs.atlassian.net/rest/api/3/issue")
+                .then().extract().response();
+
+            // Check the response code from Jira
+            def responseCode = response.statusCode();
+
+            if (responseCode != 201) {
+                throw new Exception("Authentication failed - ${response.body().asString()}");
+            } else {
+                // Parse the response and extract the issue ID and key
+                def jsonResponse = new JsonSlurper().parseText(response.body().asString());
+                def issueId = jsonResponse?.id;
+                def issueKey = jsonResponse?.key;
+
+                if (!issueId) {
+                    throw new Exception("Failed to retrieve issue ID after creating Jira issue. Response: ${jsonResponse}");
+                } else {
+                    if (!debug) {
+                    // Create a remote link in the newly created Jira issue
+                    def remoteLinkBody = """{
+                        "object": {
+                            "url": "${cmdbLink}",
+                            "title": "${summary}",
+                            "icon": {
+                                "url16x16": "https://139.229.160.117/favicon.ico"
+                            }
+                        }
+                    }""";
+
+                    def remoteLinkResponse = cmdb.rest()
+                        .headers("Content-Type", "application/json")
+                        .headers("Authorization", "Basic ${authBase64}")
+                        .body(remoteLinkBody)
+                        .post(baseUrl + "${issueId}/remotelink")
+                        .then().extract().response();
+                    }
+
+                    logger.info("\n\nCreated Jira issue: ${jsonResponse} with remote link.\n");
+
+                    // Construct the Jira issue link
+                    def jiraLink = """<a href="https://rubinobs.atlassian.net/browse/${issueKey}">Link to the issue ${issueKey}</a>""" as String
+
+                    // Return to the process the link
+                    return [
+                        Key:issueKey,
+                        JiraLink:jiraLink
+                    ]
+                }
+            }
+
+  - gate: Jira-PreventiveMaint
+    description: Jira - Preventive Maintenance
+    access: private
+    processing: realtime
+
+    handlers:
+      - type: script
+        script: |
+            import java.text.SimpleDateFormat;
+            import groovy.json.JsonSlurper;
+            import groovy.transform.Field;
+            import java.time.*;
+            import groovy.json.JsonOutput;
+
+            // =========================
+            // Create Base64 authentication from username and password
+            @Field def authBase64 = "${username}:${password}".bytes.encodeBase64().toString();
+
+            // =========================
+            // HELPER FUNCTIONS
+            // =========================
+
+            /**
+             * Determines the Jira assignee ID to use for the ticket.
+             * @param assigneeId    The existing assignee ID (if any)
+             * @param teamId        The team ID to find a supervisor for
+             * @param defAssignee   Default assignee to use if no valid assignee is found
+             * @return              The Jira assignee ID to use
+             */
+            def getAssigneeJiraId(assigneeId, teamId, defAssignee) {
+                if (assigneeId && assigneeId != -1) {
+                    return assigneeId
+                }
+
+                def supervisor = findTeamSupervisor(teamId)
+                if (!supervisor) {
+                    logger.info("No supervisor found for team: ${teamId}. Using default assignee.")
+                    return defAssignee
+                }
+
+                if (supervisor.JiraAssigneeId) {
+                    return supervisor.JiraAssigneeId
+                }
+
+                try {
+                    return getAndStoreJiraAssigneeId(supervisor.Email, supervisor.Id, defAssignee)
+                } catch (Exception e) {
+                    logger.error("Error JIRA fetching for ${supervisor.Email}: ${e.message}", e)
+                    return defAssignee
+                }
+            }
+
+            /**
+             * Finds the supervisor for a given team.
+             * @param teamId    The team ID to find the supervisor for
+             * @return          The supervisor record or null if not found
+             */
+            def findTeamSupervisor(teamId) {
+                def rows = cmdb.system().sql().query("""
+                    SELECT u."Id", u."JiraAssigneeId", u."Email"
+                    FROM "Employee" u
+                    JOIN "Team" t ON u."Id" = t."Supervisor" AND t."Status" = 'A'
+                    WHERE u."Status" = 'A' AND t."Id" = ${teamId}
+                """)
+
+                return rows ? rows[0] : null
+            }
+
+            /**
+             * Retrieves the Jira assignee ID for a given supervisor and updates the Employee record.
+             * @param supervisor   The supervisor record
+             * @param defAssignee  Default assignee ID
+             * @return             The Jira assignee ID
+             */
+            def getAndStoreJiraAssigneeId(email, employeeId, defAssignee) {
+                def response = cmdb.rest()
+                    .headers("Content-Type", "application/json")
+                    .headers("Authorization", "Basic ${authBase64}")
+                    .get("https://rubinobs.atlassian.net/rest/api/3/user/search?query=${email}")
+                    .then().extract().response()
+
+                def jsonResponse = new JsonSlurper().parseText(response.body().asString())
+                def jiraAssigneeId = (jsonResponse instanceof List && jsonResponse.size() > 0)
+                                    ? jsonResponse[0].accountId
+                                    : jsonResponse.accountId
+
+                if (response.getStatusCode() == 200 && jiraAssigneeId) {
+                    return jiraAssigneeId
+                } else {
+                    logger.info("Failed to retrieve assignee ID from Jira for employee: ${employeeId}\nAssigning default assignee. Response: ${jsonResponse}")
+                    return defAssignee
+                }
+            }
+
+            // Fetch the Preventive Maintenance process card using the provided proc_id
+            def maintProc = cmdb.existingCard("PreventiveMaint", Long.valueOf(gate.getParam("proc_id"))).fetch();
+            def assigneeId = maintProc?.Assignee?.getId()
+            def teamId = maintProc?.Team?.getId()
+            def teamName = cmdb.queryClass("Team").with("Id", teamId).fetch().find().get("Name").trim().replaceAll("\\s+", "-")
+            def assigneeJira = debug ? defAssignee : getAssigneeJiraId(assigneeId, teamId, defAssignee)
+            def parameter = cmdb.queryClass("Parameter").with("Code", "Server-URL").fetch().find().get("Value");
+            def cmdbLink = "${parameter}/ui/#processes/PreventiveMaint/instances/${gate.getParam("proc_id")}";
+            def jiraDescription = maintProc?.Description ?: "";
+            def summary = jiraDescription;
+            def procId = maintProc?.Id
+            def notes = maintProc?.ProcessNotes ?: ""
+            def jiraDueDate = maintProc?.DueExecEndDate ? new SimpleDateFormat("yyyy-MM-dd").format(maintProc.DueExecEndDate) : "";
+            def bodyDescription = cmdb.queryClass("_EmailTemplate").with("Code", 'Jira-Description').fetch().find().get("Body") ?: "";
+            def documentLink = gate.getParam("documentLink");
+            def jiraDescriptionBody = bodyDescription.replace('${documentLink}', documentLink).replace('${jiraDescription}', jiraDescription);
+            // Construct the JSON body to create a new Jira issue
+            def bodyRaw = """{
+                "fields": {
+                    "project": {
+                        "key": "${projectKey}"
+                    },
+                    "issuetype": {
+                        "name": "${issueTypeName}"
+                    },
+                    "assignee": {
+                        "id": "${debug ? defAssignee : (assigneeJira ?: defAssignee)}"
+                    },
+                    "summary": "${summary}",
+                    "priority": {
+                        "name": "${priorityName}"
+                    },
+                    "labels": [
+                        "${teamName}",
+                        "Summit", 
+                        "${plannedLabel}"
+                    ]
+                """
+
+            // Add components if not null
+            if (componentName){
+                bodyRaw += """,
+                    "components": [
+                        {
+                            "name": "${componentName}"
+                        }
+                    ]
+                """
+            }
+
+            bodyRaw += """,
+                    "description": {
+                        "version": 1,
+                        "type": "doc",
+                        "content": [
+                            ${jiraDescriptionBody}
+            """
+
+            // Add a orrizontal line + notes if is not empty
+            if (notes) {
+                bodyRaw += """,
+                        {
+                            "type": "rule"
+                        },
+                        {
+                            "type": "paragraph",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "${notes}"
+                                }
+                            ]
+                        }]
+                    }
+                """
+            } else {
+                bodyRaw += "]}"
+            }
+
+            // Add duedate if not empty
+            if (jiraDueDate){
+                bodyRaw += """, "duedate": "${jiraDueDate}"}}""";
+            } else {
+                bodyRaw += "}}"
+            }
+
+            // Send a POST request to Jira to create the issue
+            def response = cmdb.rest()
+                .headers("Content-Type", "application/json")
+                .headers("Authorization", "Basic ${authBase64}")
+                .body(bodyRaw)
+                .post("https://rubinobs.atlassian.net/rest/api/3/issue")
+                .then().extract().response();
+
+            // Check the response code from Jira
+            def responseCode = response.statusCode();
+
+            if (responseCode != 201) {
+                throw new Exception("Authentication failed - ${response.body().asString()}");
+            } else {
+                // Parse the response and extract the issue ID and key
+                def jsonResponse = new JsonSlurper().parseText(response.body().asString());
+                def issueId = jsonResponse?.id;
+                def issueKey = jsonResponse?.key;
+
+                if (!issueId) {
+                    throw new Exception("Failed to retrieve issue ID after creating Jira issue. Response: ${jsonResponse}");
+                } else {
+                    if (!debug) {
+                    // Create a remote link in the newly created Jira issue
+                    def remoteLinkBody = """{
+                        "object": {
+                            "url": "${cmdbLink}",
+                            "title": "${summary}",
+                            "icon": {
+                                "url16x16": "https://139.229.160.117/favicon.ico"
+                            }
+                        }
+                    }""";
+
+                    def remoteLinkResponse = cmdb.rest()
+                        .headers("Content-Type", "application/json")
+                        .headers("Authorization", "Basic ${authBase64}")
+                        .body(remoteLinkBody)
+                        .post(baseUrl + "${issueId}/remotelink")
+                        .then().extract().response();
+                    }
+
+                    logger.info("\n\nCreated Jira issue: ${jsonResponse} with remote link.\n");
+
+                    // Construct the Jira issue link
+                    def jiraLink = """<a href="https://rubinobs.atlassian.net/browse/${issueKey}">Link to the issue ${issueKey}</a>""" as String
+
+                    // Return to the process the link
+                    return [
+                        Key:issueKey,
+                        JiraLink:jiraLink
+                    ]
+                }
+            }
+
+  - gate: Jira-Issue-Update
+    description: Jira - Issue update
+    access: private
+    processing: realtime
+
+    handlers:
+      - type: script
+        script: |
+            import java.text.SimpleDateFormat;
+            import groovy.json.JsonSlurper;
+
+            // =========================
+            // HELPER FUNCTIONS
+            // =========================
+
+            /**
+             * Executes a POST request to Jira and handles errors uniformly.
+             * @param url         Jira endpoint (e.g. "https://domain/rest/api/3/issue/KEY/transitions")
+             * @param body        JSON payload for the request
+             * @param authBase64  Base64-encoded credentials ("user:pass")
+             * @param errorMsg    Custom error message in case of failure
+             * @return            The Response object returned by Jira
+             */
+            def postJira(url, body, authBase64, errorMsg) {
+                def response = cmdb.rest()
+                    .headers("Content-Type", "application/json")
+                    .headers("Authorization", "Basic ${authBase64}")
+                    .body(body)
+                    .post(url)
+                    .then().extract().response();
+
+                if (response.getStatusCode() < 200 || response.getStatusCode() >= 300) {
+                    throw new Exception("${errorMsg} - Response code: ${response.getStatusCode()}, body: ${response.getBody().asString()}")
+                }
+                return response
+            }
+
+            /**
+             * Executes a PUT request to Jira and handles errors uniformly.
+             * @param url         Jira endpoint (e.g. "https://domain/rest/api/3/issue/KEY")
+             * @param body        JSON payload for the request
+             * @param authBase64  Base64-encoded credentials ("user:pass")
+             * @param errorMsg    Custom error message in case of failure
+             * @return            The Response object returned by Jira
+             */
+            def putJira(url, body, authBase64, errorMsg) {
+                def response = cmdb.rest()
+                    .headers("Content-Type", "application/json")
+                    .headers("Authorization", "Basic ${authBase64}")
+                    .body(body)
+                    .put(url)
+                    .then().extract().response();
+
+                if (response.getStatusCode() < 200 || response.getStatusCode() >= 300) {
+                    throw new Exception("${errorMsg} - Response code: ${response.getStatusCode()}, body: ${response.getBody().asString()}")
+                }
+                return response
+            }
+
+            /**
+             * Performs a transition on a Jira issue (POST /transitions) and logs the result.
+             * @param issueKey     The issue key (e.g. "ABC-123")
+             * @param transitionId The transition ID
+             * @param authBase64   Base64-encoded credentials
+             * @param baseUrl      Base URL for the request (e.g. "https://domain/rest/api/3/issue/")
+             * @param successMsg   Log message in case of success
+             */
+            def doTransition(issueKey, transitionId, authBase64, baseUrl, successMsg) {
+                // exit if inputs are missing
+                if (!issueKey || !transitionId) {
+                    logger.info("Skip transition: missing issueKey or transitionId (issueKey=${issueKey}, transitionId=${transitionId})")
+                    return
+                }
+                def transitionsUrl = baseUrl + "${issueKey}/transitions"
+                def body = """{
+                    "transition": { "id": "${transitionId}" }
+                }"""
+                postJira(transitionsUrl, body, authBase64, "Failed to transition Jira issue ${issueKey}")
+                logger.info(successMsg)
+            }
+
+            /**
+             * Adds a comment to a Jira issue (POST /comment).
+             * @param issueKey   The issue key
+             * @param comment    The comment text
+             * @param notes      Additional notes (optional)
+             * @param authBase64 Base64-encoded credentials
+             * @param baseUrl    Base URL for the request
+             */
+            def addComment(issueKey, comment, authBase64, baseUrl, notes) {
+                // exit if no comment content
+                if (!issueKey || !comment?.trim()) {
+                    logger.info("Skip addComment: missing issueKey or empty comment")
+                    return
+                }
+                def commentUrl = baseUrl + "${issueKey}/comment"
+                def commentBody = """{
+                    "body": {
+                        "type": "doc",
+                        "version": 1,
+                        "content": [
+                            { "type": "paragraph", "content": [ { "type": "text", "text": "${comment}" } ] }
+                        ]
+                    }
+                }"""
+
+                // comment
+                if (notes?.trim()) {
+                    commentBody = """{
+                        "body": {
+                            "type": "doc",
+                            "version": 1,
+                            "content": [
+                                { "type": "paragraph", "content": [ { "type": "text", "text": "${comment}" } ] },
+                                { "type": "rule" },
+                                { "type": "paragraph", "content": [ { "type": "text", "text": "${notes}" } ] }
+                            ]
+                        }
+                    }"""
+                }
+
+                postJira(commentUrl, commentBody, authBase64, "Failed to add comment to Jira issue ${issueKey}")
+                logger.info("Comment added successfully to issue ${issueKey}.")
+            }
+
+            /**
+             * Helper function for retrieving the Jira assignee ID for an Employee record.
+             * @param employeeRecord The Employee record
+             * @param authBase64     Base64-encoded credentials
+             * @param defAssignee    Default assignee ID
+             * @return               The Jira assignee ID
+             * If the Employee record already has a JiraAssigneeId, return it.
+             * Otherwise, fetch the Jira assignee ID from Jira and update the Employee record.
+             */
+            def getJiraAssigneeForEmployee(employeeRecord, authBase64, defAssignee) {
+                if (employeeRecord?.JiraAssigneeId) {
+                    return employeeRecord.JiraAssigneeId
+                }
+
+                def email = employeeRecord?.Email
+                if (!email) {
+                    logger.info("No email found for employee: ${employeeRecord?.Id}, using default assignee.")
+                    return defAssignee
+                }
+
+                try {
+                    def response = cmdb.rest()
+                        .headers("Content-Type", "application/json")
+                        .headers("Authorization", "Basic ${authBase64}")
+                        .get("https://rubinobs.atlassian.net/rest/api/3/user/search?query=${email}")
+                        .then().extract().response()
+
+                    def jsonResponse = new JsonSlurper().parseText(response.body().asString())
+
+                    if (response.getStatusCode() != 200) {
+                        logger.info("API call failed with status code ${response.getStatusCode()} for employee: ${employeeRecord.Id}. Using default assignee.")
+                        return defAssignee
+                    }
+
+                    def jiraAssigneeId = null
+                    if (jsonResponse instanceof List && jsonResponse.size() > 0) {
+                        jiraAssigneeId = jsonResponse[0].accountId
+                    } else if (jsonResponse instanceof Map) {
+                        jiraAssigneeId = jsonResponse.accountId
+                    }
+
+                    if (jiraAssigneeId) {
+                        return jiraAssigneeId
+                    } else {
+                        logger.info("No Jira user found for email ${email}. Using default assignee.")
+                        return defAssignee
+                    }
+                } catch (Exception e) {
+                    logger.error("Exception occurred while getting Jira assignee for employee ${employeeRecord.Id}: ${e.message}")
+                    return defAssignee
+                }
+            }
+
+            /**
+             * Finds the supervisor for a given team.
+             * @param teamId    The team ID to find the supervisor for
+             * @return          The supervisor record or null if not found
+             */
+            def findTeamSupervisor(teamId) {
+                def rows = cmdb.system().sql().query("""
+                    SELECT u."Id", u."JiraAssigneeId", u."Email"
+                    FROM "Employee" u
+                    JOIN "Team" t ON u."Id" = t."Supervisor" AND t."Status" = 'A'
+                    WHERE u."Status" = 'A' AND t."Id" = ${teamId}
+                """)
+
+                return rows ? rows[0] : null
+            }
+
+            /**
+             * Performs label update on a Jira issue (PUT) and logs the result.
+             * @param issueKey     The issue key (e.g. "ABC-123")
+             * @param teamName     The team name
+             * @param authBase64   Base64-encoded credentials
+             * @param baseUrl      Base URL for the request (e.g. "https://domain/rest/api/3/issue/")
+             * @param successMsg   Log message in case of success
+             */
+            def changeTeam(issueKey, teamId, teamName, authBase64, baseUrl, successMsg) {
+                // exit if teamName is empty
+                if (!issueKey || !teamName?.trim()) {
+                    logger.info("Skip changeTeam: missing issueKey or teamName")
+                    return
+                }
+
+                // label change
+                def supervisor = findTeamSupervisor(teamId)
+                def assigneeId = supervisor?.JiraAssigneeId ?: defAssignee  // Jira accountId
+                def cleanTeam = teamName.trim().replaceAll("\\s+", "-")
+                def issueUrl = baseUrl + issueKey
+                def body = """
+                {
+                    "fields": {
+                    "labels": ["Summit", "${cleanTeam}"],
+                    "assignee": {
+                        "id": "${(assigneeId)}"
+                    }
+                    }
+                }"""
+                putJira(issueUrl, body, authBase64, "Failed to change team label in Jira issue ${issueKey}")
+                logger.info(successMsg)
+            }
+
+            // Runs changeTeam only when requested
+            def applyTeamChange(teamChange, issueKey, teamId, teamName, authBase64, baseUrl) {
+                if (!teamChange || !issueKey || !teamName?.trim() || !teamId) {
+                    logger.info("Skip team change: missing teamChange flag, issueKey, teamId or teamName")
+                    return
+                }
+                changeTeam(issueKey, teamId, teamName, authBase64, baseUrl, "Successfully changed team label and supervisor in Jira issue ${issueKey}")
+            }
+
+            // get issueKey from JiraLink if needed
+            def extractIssueKeyFromJiraLink(jiraLink) {
+                if (!jiraLink) return null
+                try {
+                    def parts = jiraLink.split('browse/')
+                    if (parts.size() < 2) return null
+                    def tail = parts[1]
+                    // rimuove eventuali query/quote
+                    return tail.split('[\"?]')[0]
+                } catch (ignored) {
+                    return null
+                }
+            }
+
+            // =========================
+            // MAIN LOGIC
+            // =========================
+            try {
+                // --- validate inputs ---
+                def procId = Long.valueOf(gate.getParam("proc_id"))
+                if (!procId) {
+                    logger.error("Missing parameter: proc_id")
+                    return
+                }
+
+                def maintProc = cmdb.existingCard("PreventiveMaint", procId).fetch()
+                if (!maintProc) {
+                    logger.error("PreventiveMaint not found for proc_id=${procId}")
+                    return
+                }
+
+                def jiraLink = gate.getParam("JiraLink") ?: maintProc?.JiraLink
+                def issueKey = gate.getParam("Key") ?: (jiraLink ? jiraLink.split('browse/')[1].split('"')[0] : null)
+                if (!issueKey) {
+                    logger.error("Missing issueKey (Key param or JiraLink)")
+                    return
+                }
+
+                def action = maintProc?.Action?.getCode()
+                if (!action) {
+                    logger.info("No action specified for proc_id=${procId}, nothing to do.")
+                    return
+                }
+
+                // inputs
+                def teamChange = gate.getParam("teamChange") ?: false
+                def comment = gate.getParam("comment")
+                def notes = maintProc?.ProcessNotes ?: ""
+                def authBase64 = "${username}:${password}".bytes.encodeBase64().toString()
+                def dateFormat = new SimpleDateFormat("dd MMM yyyy", Locale.ENGLISH)
+                def assigneeId = maintProc?.Assignee?.getId()
+                def teamId = maintProc?.Team?.getId()
+                def teamName = teamId ? cmdb.queryClass("Team").with("Id", teamId).fetch().find().get("Name").trim().replaceAll("\\s+", "-") : null
+
+                def id           = gate.getParam("id")            // generic transition
+                def rejectedId   = gate.getParam("rejectedId")    // REJECTED
+                def approvedId   = gate.getParam("approveId")     // APPROVED
+                def cancelledId  = gate.getParam("cancelId")      // CANCELLED
+
+                // Transition logic
+                if (action in ["PM-Schedule_BackNext", "PM-Schedule_BackAll", "PM-Schedule_Reject", "PM-Schedule_Pause"]) {
+
+                    // Set the LIMIT clause depending on the action
+                    def functionName = (action in ["PM-Schedule_BackNext", "PM-Schedule_Reject"]) ?
+                        "utils_jira_process_info_get_first" :
+                        "utils_jira_process_info_get_all"
+
+                    def jira_issue_list = cmdb.system().sql().query("""SELECT * FROM ${functionName}(${maintProc.PrevMaintConfig.getId()}, ${maintProc.Site.getId()}, ${maintProc.CISubset.getId()})""")
+
+                    // Process the results
+                    if (action in ["PM-Schedule_BackNext", "PM-Schedule_BackAll"]) {
+                        jira_issue_list?.each { obj ->
+                            // Check if the OrgExecEndDate is different from the DueExecEndDate
+                            if (obj.OrgExecEndDate != obj.DueExecEndDate && obj.ActivityDefinitionId in ['PM-Opening', 'PM-Assignment']) {
+                                // Update the Preventive Maintenance card with a specific message indicating a Jira change
+                                cmdb.existingCard("PreventiveMaint", obj.Id)
+                                    .with("Message", cmdb.selectLookupByCode("COMMON - Message", "PM-Schedule_JiraChanges"))
+                                    .with("OrgExecEndDate", maintProc.DueExecEndDate)
+                                    .update()
+
+                            }
+
+                            // get future issue key (if any) from the future PM card
+                            def futureKey = extractIssueKeyFromJiraLink(obj.JiraLink as String)
+
+                            if (futureKey) {
+                                // Perform a REST API GET request to retrieve additional Jira information for the issue
+                                def response = cmdb.rest()
+                                    .headers("Content-Type", "application/json")
+                                    .headers("Authorization", "Basic ${authBase64}")
+                                    .get(baseUrl + futureKey + "?" + issueFieldFilter) // Fetch issue details using the issueKey
+                                    .then()
+                                    .extract()
+                                    .body()
+                                    .print();
+
+                                // Parse the JSON response from Jira
+                                def slurper = new groovy.json.JsonSlurper();
+                                def jira_response = slurper.parseText(response);
+
+                                // Add a comment to the Jira ticket
+                                comment = "The due date was changed from ${jira_response.fields.duedate} to ${dateFormat.format(maintProc.DueExecEndDate)}."
+
+                                // Update the due date in Jira via a PUT request
+                                def duedateUrl = baseUrl + "${futureKey}"
+                                def duedateBody = """{
+                                    "fields": {
+                                        "duedate": "${new SimpleDateFormat("yyyy-MM-dd").format(maintProc.DueExecEndDate)}"
+                                    }
+                                }"""
+
+                                // Send the PUT request
+                                putJira(duedateUrl, duedateBody, authBase64, "Failed to update duedate")
+                                logger.info("Duedate: ${dateFormat.format(maintProc.DueExecEndDate)} and Message updated successfully for issue ${futureKey}.")
+                            } else {
+                                logger.info("Back*: PM ${obj.Id} has no JiraLink -> Jira duedate skipped (CMDB updated if needed).")
+                            }
+                        }
+                    }
+                    else if (action == "PM-Schedule_Pause") {
+                        if (!jira_issue_list || jira_issue_list.isEmpty()) {
+                            logger.info("PM-Schedule_Pause: no future processes found, nothing to update.")
+                        } else {
+                            jira_issue_list?.each { obj ->
+                                // get future issue key (if any) from the future PM card
+                                def futureLink = obj.JiraLink as String
+                                def futurePmId = obj.Id as Long
+                                def futureKey = extractIssueKeyFromJiraLink(futureLink)
+
+                                if (!futureLink) {
+                                    // Opening -> skip
+                                    logger.info("PM-Schedule_Pause: next future PM ${futurePmId} is at Opening (no Jira ticket) -> skip update.")
+                                } else {
+                                    // Update the due date in Jira to the ResumeDate via a PUT request
+                                    def duedateUrl = baseUrl + "${futureKey}"
+                                    def duedateBody = """{
+                                        "fields": {
+                                            "duedate": "${new SimpleDateFormat("yyyy-MM-dd").format(maintProc.ResumeDate)}"
+                                        }
+                                    }"""
+                                    putJira(duedateUrl, duedateBody, authBase64, "Failed to update duedate as resumedate")
+                                    logger.info("Duedate set to ResumeDate successfully for issue ${futureKey}.")
+                                }
+                            }
+                        }
+                    }
+                    else if (action == "PM-Schedule_Reject") {
+                        // Cancel the next future process on JIRA if it's in Assignment (has JiraLink); if it's Opening (no link) -> skip
+                        if (!jira_issue_list || jira_issue_list.isEmpty()) {
+                            logger.info("PM-Schedule_Reject: no future processes found, nothing to cancel.")
+                        } else {
+                            def obj = jira_issue_list
+                            logger.info("obj: ${obj}")
+                            // get future issue key (if any) from the future PM card
+                            def futureLink = obj.JiraLink as String
+                            def futurePmId = obj.Id as Long
+                            def futureKey = extractIssueKeyFromJiraLink(futureLink)
+
+                            if (!futureLink) {
+                                // Opening -> skip
+                                logger.info("PM-Schedule_Reject: next future PM ${futurePmId} is at Opening (no Jira ticket) -> skip cancellation.")
+                            } else {
+                                if (!id || !cancelledId) {
+                                    logger.error("PM-Schedule_Reject: missing transition parameters (id=${id}, cancelledId=${cancelledId}) for future issue ${futureKey}.")
+                                } else {
+                                    // CANCEL the future JIRA ticket
+                                    doTransition(futureKey, id, authBase64, baseUrl, "Future issue ${futureKey} transitioned successfully using provided transition id: ${id}.")
+                                    doTransition(futureKey, cancelledId, authBase64, baseUrl, "Future issue ${futureKey} has been cancelled successfully.")
+                                }
+                            }
+                        }
+                    }
+                }
+                else if (action in ["PM-Review_Back", "PM-Review_Reject"] && rejectedId) {
+
+                    // REJECTED -> IN PROGRESS
+                    doTransition(issueKey, rejectedId, authBase64, baseUrl, "Issue ${issueKey} transitioned to REJECTED successfully.")
+                    doTransition(issueKey, id, authBase64, baseUrl, "Issue ${issueKey} transitioned to IN PROGRESS successfully after REJECTED.")
+                }
+                else if (action == "PM-Review_Advance" && approvedId) {
+
+                    // APPROVED -> DONE
+                    doTransition(issueKey, approvedId, authBase64, baseUrl, "Issue ${issueKey} transitioned to APPROVED successfully.")
+                    doTransition(issueKey, id, authBase64, baseUrl, "Issue ${issueKey} transitioned to DONE successfully after APPROVED.")
+                }
+                else if (action == "PM-Assignment_Return") {
+
+                    applyTeamChange(teamChange, issueKey, teamId, teamName, authBase64, baseUrl)
+                    // If the action is "PM-Assignment_Return", add the watcher
+                    def assigneeFetch = cmdb.system().sql().query("SELECT u.\"Id\", u.\"JiraAssigneeId\", u.\"Email\" FROM \"Employee\" u WHERE u.\"Status\" = 'A' AND u.\"Id\" = ${assigneeId}")
+                    if (!assigneeFetch || assigneeFetch.size() == 0) {
+                        logger.info("No assignee found with id: ${assigneeId}")
+                    }
+                    def employeeRecord = assigneeFetch[0]
+                    def watcherJira = getJiraAssigneeForEmployee(employeeRecord, authBase64, defAssignee)
+                    def watchBody = """{
+                        "watchers": [
+                            {
+                                "accountId": "${watcherJira}"
+                            }
+                        ]
+                    }"""
+                    def watchUrl = baseUrl + "${issueKey}/watchers"
+                    postJira(watchUrl, watchBody, authBase64, "Failed to add watcher to Jira issue ${issueKey} ${watcherJira}")
+                }
+                else if (id) {
+                    // Generic transition
+                    doTransition(issueKey, id, authBase64, baseUrl, "Issue ${issueKey} transitioned successfully using provided transition id: ${id}.")
+                    if (action == "PM-Assignment_Reject") {
+                        // IN PROGRESS -> CANCELLED
+                        doTransition(issueKey, cancelledId, authBase64, baseUrl, "Issue ${issueKey} has been cancelled successfully.")
+                    }
+                    // If the action is "PM-Execution_Advance", update the assignee
+                    if (action == "PM-Execution_Advance" || action == "PM-Undertaking_Reject") {
+                        //def supervisorFetch = cmdb.system().sql().query("SELECT u.\"Id\", u.\"JiraAssigneeId\", u.\"Email\" FROM \"Employee\" u JOIN \"Team\" t ON u.\"Id\" = t.\"Supervisor\" AND t.\"Status\" = 'A' WHERE u.\"Status\" = 'A' AND t.\"Id\" = ${teamId}")
+                        def supervisorFetch = findTeamSupervisor(teamId)
+                        if (!supervisorFetch || supervisorFetch.size() == 0) {
+                            logger.info("No supervisor found for team: ${teamId}")
+                        }
+                        def supervisor = supervisorFetch[0]
+                        assigneeJira = getJiraAssigneeForEmployee(supervisor, authBase64, defAssignee)
+                        // Update the assignee via PUT /issue/{issueKey}
+                        def assigneeUrl = baseUrl + "${issueKey}"
+                        def assigneeBody = """{
+                            "fields": {
+                                "assignee": {
+                                    "accountId": "${assigneeJira}"
+                                }
+                            }
+                        }"""
+
+                        putJira(assigneeUrl, assigneeBody, authBase64, "Failed to update assignee")
+                        logger.info("Assignee updated successfully for issue ${issueKey}.")
+                    }
+                }
+
+                // Add comment if present
+                if (comment) {
+                    addComment(issueKey, comment, authBase64, baseUrl, notes)
+                }
+            } catch (Exception e) {
+                logger.error("Error in Jira issue update: ${e.message}")
+                return
+            }
+
+  - gate: Jira-GetUpdates
+    description: Jira get updates
+    access: private
+    processing: realtime
+
+    handlers:
+      - type: script
+        script: |
+
+          def slurper = new groovy.json.JsonSlurper();
+
+          // get all active jira issue
+          def jira_issue_list = cmdb.system().sql().query("""
+              SELECT
+                  pm."Id",
+                  (regexp_match(pm."JiraLink",'$issuePrefix[0-9\\(\\)]+'))[1] AS "issueKey",
+                  pm."DueExecEndDate"::text,
+                  pm."JiraAssignee",
+                  pm."ActivityDefinitionId"[1] AS "ActivityDefinitionId"
+              FROM "PreventiveMaint" pm
+              WHERE pm."Status" = 'A'
+                  AND pm."JiraLink" IS NOT NULL
+                  AND _cm3_lookup_code(pm."FlowStatus") = 'open.running'
+                  AND pm."ActivityDefinitionId"[1] IN ('PM-Assignment', 'PM-Undertaking')
+          """);
+
+          def authBase64 = "${username}:${password}".bytes.encodeBase64().toString();
+
+          // get the action cancel and status lookup ids
+          def cancelAction = cmdb.selectLookupByCode("Process - Action", "PM-Assignment_Reject").getId();
+          def cancelStatus = cmdb.selectLookupByCode("Process - ProcessStatus", "PM-Canceled").getId();
+
+          // action PM-Acceptance -> PM-Undertaking
+          def advanceAction = cmdb.selectLookupByCode("Process - Action", "PM-Assignment_Advance").getId();
+
+          // check if issues have been updated
+          for (obj in jira_issue_list) {
+
+              def response = cmdb.rest()
+                  .headers("Content-Type", "application/json")
+                  .headers("Authorization", "Basic ${authBase64}")
+                  .get(baseUrl + obj.issueKey + "?" + issueFieldFilter)
+                  .then()
+                  .extract()
+                  .body()
+                  .print();
+
+              // next val if response is empty
+              if (response.isEmpty()) {
+                  continue;
+              }
+
+              def jira_response = slurper.parseText(response);
+
+              // cancell ticket
+              if (jira_response.fields.status.name == 'Cancelled' && obj.ActivityDefinitionId == 'PM-Assignment') {
+                  cmdb.existingCard("PreventiveMaint", obj.Id)
+                      .with("Action", cancelAction)
+                      .with("ProcessStatus", cancelStatus)
+                      .with("ProcessNotes", 'This scheduled maintenance activity has been canceled on Jira.')
+                      .update();
+
+                  cmdb.existingProcessInstance("PreventiveMaint", obj.Id).advance();
+                  continue;
+              }
+
+              // duedate check and update
+              if (jira_response.fields.duedate != null) {
+                  def currentDueDate = obj.DueExecEndDate != null ? obj.DueExecEndDate.substring(0, 10) : null;
+
+                  if (jira_response.fields.duedate != currentDueDate) {
+                      cmdb.existingCard("PreventiveMaint", obj.Id)
+                          .with("DueExecEndDate", jira_response.fields.duedate)
+                          .with("AutomaticConfig", false)
+                          .with("ProcessNotes", 'The due execution date of this activity has been updated on Jira.')
+                          .update();
+                  }
+              }
+
+              // assignees data
+              def jiraAssignee = jira_response.fields.assignee?.accountId
+              def currentAssignee = obj.JiraAssignee;
+
+              // check if the current process jira_assignee is null; if so, update it with the jira-issue assignee
+              if (!currentAssignee && jiraAssignee) {
+                  cmdb.existingCard("PreventiveMaint", obj.Id)
+                      .with("JiraAssignee", jiraAssignee)
+                      .update();
+                  currentAssignee = jiraAssignee;
+              }
+
+              // assignee changed -> move to PM-Undertaking
+              if (jiraAssignee && jiraAssignee != currentAssignee && obj.ActivityDefinitionId == 'PM-Assignment') {
+                  cmdb.existingCard("PreventiveMaint", obj.Id)
+                      .with("JiraAssignee", jiraAssignee)
+                      .with("Action", advanceAction)
+                      .with("ProcessNotes", 'The assignee has changed on Jira; the activity has been moved to Handoff.')
+                      .update();
+
+                  cmdb.existingProcessInstance("PreventiveMaint", obj.Id).advance();
+              }
+
+          }
+
+          return true;
+  - gate: Jira-EmployeeSync
+    handlers:
+      - type: script
+        script: |
+            import groovy.json.JsonSlurper;
+            def authBase64 = "${username}:${password}".bytes.encodeBase64().toString();
+            def missingEmployeeList = [];
+            // Fetch all employees
+            cmdb.queryClass("Employee")
+                .fetch()
+                .each { employee ->
+                    def email = employee.get("Email");
+                    def currentJiraId = employee.get("JiraAssigneeId");
+                    def description = employee.get("Description");
+                    
+                    // Do request in order to retrieve employee on Jira
+                    def response = cmdb.rest()
+                        .headers("Content-Type", "application/json")
+                        .headers("Authorization", "Basic ${authBase64}")
+                        .get("https://rubinobs.atlassian.net/rest/api/3/user/search?query=${email}")
+                        .then().extract().response();
+
+                    // Retrieve accountId from jira
+                    def jsonResponse = new JsonSlurper().parseText(response.body().asString()).accountId;
+                    if(!jsonResponse){
+                        logger.info("Employee not found in Jira for email ${email}");
+                        // Blank JiraAssigneeId on CMDBuild
+                        cmdb.existingCard("Employee", employee.getId())
+                            .with("JiraAssigneeId", null)
+                            .update();
+                        missingEmployeeList.add(description);
+
+                        return;
+                    } 
+                    def accountId = jsonResponse[0];
+
+                    logger.info("Employee with accountId: ${accountId} found for employee ${email}");
+
+                    if(accountId != currentJiraId){
+                        logger.info("Update Employee ${email}. Old accountId: ${currentJiraId}. New accountId: ${accountId}");
+                        
+                        // Update employee with new Jira assignee Id
+                        cmdb.existingCard("Employee", employee.getId())
+                            .with("JiraAssigneeId", accountId)
+                            .update();
+                    } else {
+                        logger.info("No update needed for employee: ${email}");
+                    }
+                }
+            
+            if(!missingEmployeeList.isEmpty()){
+                def team = cmdb.queryClass("Team").with("Code", toEmplstoEmplsTeamCode).fetch();
+
+                if(!team){
+                    return
+                }
+
+                def teamId = team[0].getId();
+
+                def toAddresses = cmdb.system().sql().query(
+                    """
+                        SELECT e."Email"
+                        FROM "Map_TeamsEmployees" map
+                            JOIN "Employee" e ON e."Id" = map."IdObj2"
+                        WHERE "IdObj1" = ${teamId}
+                    """
+                ).collect { it.get("Email") }
+                .join(',');
+                
+                cmdb.newMail()
+                    .fromTemplate(
+                        "Jira-EmployeeSync-MissingEmail",
+                        [
+                            "toRole": toAddresses,
+                            "employeeRow": missingEmployeeList
+                        ]
+                    )
+                    .send();
+            }
